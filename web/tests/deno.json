@@ -1,8 +1,0 @@
-{
-  "tasks": {
-    "test": "deno test -A ./"
-  },
-  "compilerOptions": {
-    "lib": ["deno.ns", "deno.unstable", "dom"]
-  }
-}

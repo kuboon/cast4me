@@ -1,103 +1,111 @@
 /**
- * Service worker for the RP app.
+ * cast4me service worker — downloads the next episodes ahead, and serves them from the cache.
  *
- * Receives Web Push messages sent by the IdP (id.kbn.one) — which signs them
- * with its VAPID key — and renders them as notifications on this origin. The
- * subscription itself is created in the page (see lib/push/manager.ts) and
- * stored on the IdP; this worker only handles delivery + click routing.
+ * Served from `/sw.js` (a route of its own in `server/app.tsx`, not a file under `static/`) so its
+ * scope is the whole site. The player posts `{ type: "precache", urls, keep }`: `urls` are the
+ * next few episodes to have on the device, `keep` everything still in the queue. Anything cached
+ * and no longer in `keep` was played, and is dropped.
  *
- * Served at `${base}/sw.js` by the `sw.js` route in server/router.tsx (verbatim).
+ * Media elements fetch with `Range`, and a cached response is the whole file, so ranges are cut
+ * out of it here — iOS refuses to play audio answered with a plain `200` to a range request.
  */
 
-const DEFAULT_TITLE = "Remix3 on Deno";
+const AUDIO_CACHE = "cast4me-audio-v1";
 
-self.addEventListener("install", (event) => {
-  event.waitUntil(self.skipWaiting());
-});
+self.addEventListener("install", () => self.skipWaiting());
 
 self.addEventListener("activate", (event) => {
-  event.waitUntil(self.clients.claim());
+  event.waitUntil(
+    (async () => {
+      for (const name of await caches.keys()) {
+        if (name.startsWith("cast4me-") && name !== AUDIO_CACHE) {
+          await caches.delete(name);
+        }
+      }
+      await self.clients.claim();
+    })(),
+  );
 });
 
-const parsePushData = (event) => {
-  if (!event.data) {
-    return {};
+self.addEventListener("message", (event) => {
+  const data = event.data;
+  if (data?.type !== "precache") return;
+  event.waitUntil(precache(data.urls ?? [], data.keep ?? []));
+});
+
+/** Paths with a download already under way, so repeated messages do not start a second. */
+const inflight = new Set();
+
+async function precache(urls, keep) {
+  const cache = await caches.open(AUDIO_CACHE);
+  const keepPaths = new Set(
+    keep.map((u) => new URL(u, self.location).pathname),
+  );
+  for (const request of await cache.keys()) {
+    if (!keepPaths.has(new URL(request.url).pathname)) {
+      await cache.delete(request);
+    }
   }
-  try {
-    const json = event.data.json();
-    return typeof json === "object" && json !== null ? json : {};
-  } catch {
+  for (const url of urls) {
+    const path = new URL(url, self.location).pathname;
+    if (inflight.has(path) || await cache.match(path)) continue;
+    inflight.add(path);
     try {
-      const text = event.data.text();
-      return { body: text };
+      const res = await fetch(path);
+      if (res.ok && res.status === 200) await cache.put(path, res);
     } catch {
-      return {};
+      // Offline or the server is busy; the next message tries again.
+    } finally {
+      inflight.delete(path);
     }
   }
-};
+}
 
-// Apply the app-badge count (Badging API) the IdP forwarded in the payload.
-// A count of 0 clears the badge; anything else sets it. No-op where the API
-// is unavailable (e.g. desktop Chrome without an installed PWA).
-const applyBadgeCount = async (badgeCount) => {
-  if (typeof badgeCount !== "number" || !Number.isFinite(badgeCount)) return;
-  try {
-    if (badgeCount > 0 && "setAppBadge" in navigator) {
-      await navigator.setAppBadge(Math.trunc(badgeCount));
-    } else if ("clearAppBadge" in navigator) {
-      await navigator.clearAppBadge();
-    }
-  } catch {
-    /* Badging API unavailable or rejected — ignore. */
-  }
-};
-
-self.addEventListener("push", (event) => {
-  const data = parsePushData(event);
-  const title = typeof data.title === "string" && data.title.trim()
-    ? data.title
-    : DEFAULT_TITLE;
-  const options = {
-    body: typeof data.body === "string" ? data.body : undefined,
-    icon: typeof data.icon === "string" ? data.icon : undefined,
-    badge: typeof data.badge === "string" ? data.badge : undefined,
-    tag: typeof data.tag === "string" ? data.tag : undefined,
-    requireInteraction: Boolean(data.requireInteraction),
-    data: {
-      ...(typeof data.data === "object" && data.data ? data.data : {}),
-      url: typeof data.url === "string" ? data.url : undefined,
-    },
-  };
-
-  event.waitUntil(Promise.all([
-    self.registration.showNotification(title, options),
-    applyBadgeCount(data.badgeCount),
-  ]));
-});
-
-self.addEventListener("notificationclick", (event) => {
-  event.notification.close();
-  const url = event.notification.data?.url;
-  if (!url) {
+self.addEventListener("fetch", (event) => {
+  const url = new URL(event.request.url);
+  if (
+    event.request.method !== "GET" || url.origin !== self.location.origin ||
+    !url.pathname.startsWith("/audio/")
+  ) {
     return;
   }
-  event.waitUntil((async () => {
-    const windowClients = await self.clients.matchAll({
-      type: "window",
-      includeUncontrolled: true,
-    });
-    for (const client of windowClients) {
-      if (client.url === url && "focus" in client) {
-        await client.focus();
-        return;
-      }
-    }
-    if (self.clients.openWindow) {
-      await self.clients.openWindow(url);
-    }
-  })());
+  event.respondWith(serveAudio(event.request, url.pathname));
 });
 
-self.addEventListener("pushsubscriptionchange", (event) => {
-  console.warn("Push subscription changed", event);
-});
+async function serveAudio(request, path) {
+  const cache = await caches.open(AUDIO_CACHE);
+  const cached = await cache.match(path);
+  if (!cached) return fetch(request);
+
+  const range = request.headers.get("range");
+  if (!range) return cached;
+
+  const blob = await cached.blob();
+  const size = blob.size;
+  const m = range.match(/^bytes=(\d*)-(\d*)$/);
+  if (!m || (m[1] === "" && m[2] === "")) return cached;
+  let start;
+  let end;
+  if (m[1] === "") {
+    start = Math.max(0, size - Number(m[2]));
+    end = size - 1;
+  } else {
+    start = Number(m[1]);
+    end = m[2] === "" ? size - 1 : Math.min(Number(m[2]), size - 1);
+  }
+  if (start >= size || start > end) {
+    return new Response(null, {
+      status: 416,
+      headers: { "content-range": `bytes */${size}` },
+    });
+  }
+  return new Response(blob.slice(start, end + 1), {
+    status: 206,
+    headers: {
+      "content-type": cached.headers.get("content-type") ?? blob.type,
+      "content-range": `bytes ${start}-${end}/${size}`,
+      "content-length": String(end - start + 1),
+      "accept-ranges": "bytes",
+    },
+  });
+}
