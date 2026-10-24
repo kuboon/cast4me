@@ -1,59 +1,34 @@
 /**
  * Every URL the app answers, in one place.
  *
- * `server/router.tsx` maps these to the controllers that answer them, and everything that links
- * reads `routes.my.href()` rather than rebuilding `${base}/my` at each call site.
+ * `server/app.tsx` maps these to the actions that answer them, and everything that links reads
+ * `routes.share.href()` rather than spelling `/share` at each call site. The client islands import
+ * this file too, which is why it lives in `client/`.
  *
- * The map is built with the deploy prefix as its base, so hrefs are correct under a GitHub Pages
- * repo sub-path or a PR preview URL without anyone prepending anything. On Cloudflare `base` is
- * empty.
+ * Access is split the way the daemon is exposed through Cloudflare Tunnel:
  *
- * Two kinds of route live here and they are deployed differently:
- *
- * - **Pages** (`home`, `hydration`, `my`) are rendered to static HTML by the GitHub Pages build as
- *   well as served from the static build by Cloudflare.
- * - **Server routes** (`jwks` and everything under `api`) only exist on the live server. Nothing
- *   links to them, so the static build's crawl never reaches them, and they are not in
- *   `entryPoints`. The client may still name them (`routes.api.notify.href()`), which is why the
- *   shapes are stated here — a static deploy simply has no server to answer them.
+ * - **Restricted**: `api.items` (ネタ投入) needs `Authorization: Bearer <INGEST_TOKEN>`.
+ * - **Public**: everything else. Audio URLs carry an unguessable ULID rather than a secret.
  */
 
-import { get, post, route } from "@remix-run/fetch-router/routes";
+import { get, post, put, route } from "@remix-run/fetch-router/routes";
 
-import { base } from "./base.ts";
-
-export const routes = route(base, {
+export const routes = route("", {
+  /** The player PWA. */
   home: get("/"),
-  // [feature:hydration-demo]
-  hydration: get("/hydration"),
-  // [feature:signin] (the push card on this page is [feature:push])
-  my: get("/my"),
-  // [feature:fullscreen]
-  fullscreen: get("/fullscreen"),
-  // [feature:showcase]
-  showcase: get("/showcase"),
-  // [feature:spa]
-  spa: route("spa", {
-    /** One view of the SPA demo; the build generates each as its own static file. */
-    show: get("/:id"),
-  }),
-  // [feature:blog]
-  blog: route("blog", {
-    index: get("/"),
-    /** One article. Articles are Markdown files; `server/blog/` answers this by reading the slug's file. */
-    show: get("/:slug"),
-  }),
-  // [feature:server-send] RP public JWKS — lets the IdP verify our `private_key_jwt` assertions.
-  jwks: get("/.well-known/jwks.json"),
+  /** Manual ingest form, and the Web Share Target's landing page (`?title=&text=&url=`). */
+  share: get("/share"),
+  /** Podcast RSS with enclosures — the fallback for an ordinary podcast app. */
+  feed: get("/feed.xml"),
+  /** Audio by episode id, optionally with its extension (`<id>.mp3`) for podcast apps. */
+  audio: get("/audio/:id(.:ext)"),
+  manifest: get("/manifest.webmanifest"),
   api: route("api", {
-    // [feature:server-send] Server-initiated push fan-out (delegates to the IdP). Not DPoP-protected.
-    notify: post("/notify"),
-    // [feature:turso] Turso (libSQL) + @remix-run/data-table sample.
-    turso: get("/turso"),
-    // [feature:protected-api] DPoP-protected JSON endpoints; `server/router.tsx` puts the DPoP middleware on this group.
-    protected: route("protected", {
-      get: get("/"),
-      post: post("/"),
-    }),
+    /** ネタ投入. Restricted (Bearer token). */
+    items: post("/items"),
+    /** Unplayed episodes, oldest first, for the player. */
+    queue: get("/queue"),
+    /** Playback finished (or skipped). Body: `{ "feedback"?: "like" | "skip" }`. */
+    played: put("/episodes/:id/played"),
   }),
 });

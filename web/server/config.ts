@@ -1,109 +1,139 @@
 /**
- * Server-side configuration, decoupled from the host runtime's environment.
+ * Server configuration, read from the environment once.
  *
- * Cloudflare Workers hand the environment to `fetch(request, env, ctx)` as an
- * object. This module models that shape ({@link Env}) and derives the typed
- * {@link Config} from it via {@link loadConfig}. Deno has no such parameter, so
- * {@link denoEnv} reads the same keys from `Deno.env` into an {@link Env} — the
- * single point of `Deno.env` access, kept here so it is easy to swap per host.
- *
- * {@link getConfig} self-sources the env on both hosts — no wiring needed:
- * `Deno.env` on Deno, otherwise the Cloudflare Workers `cloudflare:workers`
- * `env` module. The latter is a dynamic `import()` so Deno (which has no such
- * module) falls through instead of crashing at load — a static import of
- * `cloudflare:workers` throws an uncatchable "Unsupported scheme" error on Deno.
+ * `loadConfig(env)` turns a plain record into the typed {@link Config}, so tests build one without
+ * touching `Deno.env`; `getConfig()` is the process's own, read at module load. Every environment
+ * variable the daemon reads is listed in {@link ENV_KEYS} — and in the `dev` permission set of
+ * `web/server/deno.json`, which must stay in step with it.
  */
 
-/** Environment as Cloudflare Workers passes it to `fetch(request, env)`. */
-export interface Env {
-  readonly IDP_ORIGIN?: string;
-  readonly RP_ORIGIN?: string;
-  readonly RP_SIGNING_KEY_JWK?: string;
-  readonly TURSO_DATABASE_URL?: string;
-  readonly TURSO_AUTH_TOKEN?: string;
-}
+export type ScriptProviderName = "anthropic" | "dummy";
+export type TtsProviderName = "openai" | "command" | "dummy";
 
 /** Parsed, typed configuration used across the server. */
 export interface Config {
-  /** Origin of the IdP (id.kbn.one). Mirrors the client's `IDP_ORIGIN`. */
-  readonly idpOrigin: string;
-  /**
-   * This app's own public origin — the `clientId` / `iss` / `sub` of the
-   * `private_key_jwt` client assertion. Must be whitelisted on the IdP and be
-   * the origin it fetches `/.well-known/jwks.json` from. Empty until set; the
-   * push send path surfaces a clear error in that case.
-   */
-  readonly rpOrigin: string;
-  /**
-   * Optional ES256 private key (JWK JSON) for signing client assertions and
-   * publishing JWKS. When empty an ephemeral key is generated per process
-   * (fine for dev; set a fixed key in production).
-   */
-  readonly rpSigningKeyJwk: string;
-  /** Turso (libSQL) database URL for the `/api/turso` sample. */
-  readonly tursoDatabaseUrl: string;
-  /** Turso access token. */
-  readonly tursoAuthToken: string;
-}
-
-/** Derive the typed {@link Config} from a raw host env record. */
-export function loadConfig(env: Env): Config {
-  return {
-    idpOrigin: env.IDP_ORIGIN ?? "https://id.kbn.one",
-    rpOrigin: env.RP_ORIGIN ?? "",
-    rpSigningKeyJwk: env.RP_SIGNING_KEY_JWK ?? "",
-    tursoDatabaseUrl: env.TURSO_DATABASE_URL ?? "",
-    tursoAuthToken: env.TURSO_AUTH_TOKEN ?? "",
+  /** Where the Deno KV file and the audio files live. */
+  readonly dataDir: string;
+  /** The public origin behind Cloudflare Tunnel, for absolute URLs in `feed.xml`. */
+  readonly publicOrigin: string;
+  /** Bearer token for `POST /api/items`. Empty means ingest is refused outright. */
+  readonly ingestToken: string;
+  /** Keep this many unplayed episodes ready. */
+  readonly targetUnplayed: number;
+  /** Rough length of one episode, in minutes. */
+  readonly episodeMinutes: number;
+  /** How often the refill loop runs even without a trigger. */
+  readonly refillIntervalSec: number;
+  /** RSS / Atom feeds to pull ネタ from. */
+  readonly rssFeeds: readonly string[];
+  readonly rssIntervalMin: number;
+  /** Themes to fall back on when the ネタ queue runs dry. Empty means "wait for ネタ". */
+  readonly fallbackThemes: readonly string[];
+  readonly script: {
+    readonly provider: ScriptProviderName;
+    readonly anthropicModel: string;
+  };
+  readonly tts: {
+    readonly provider: TtsProviderName;
+    readonly openaiApiKey: string;
+    readonly openaiModel: string;
+    readonly openaiVoice: string;
+    readonly openaiInstructions: string;
+    /** For `command`: run with `{in}` (text file) and `{out}` (audio file) substituted. */
+    readonly command: string;
+    /** For `command`: the extension `{out}` gets, which also decides the content type. */
+    readonly commandExt: string;
   };
 }
 
 /** Keys read from the host environment. */
-const ENV_KEYS = [
-  "IDP_ORIGIN",
-  "RP_ORIGIN",
-  "RP_SIGNING_KEY_JWK",
-  "TURSO_DATABASE_URL",
-  "TURSO_AUTH_TOKEN",
+export const ENV_KEYS = [
+  "DATA_DIR",
+  "PUBLIC_ORIGIN",
+  "INGEST_TOKEN",
+  "TARGET_UNPLAYED",
+  "EPISODE_MINUTES",
+  "REFILL_INTERVAL_SEC",
+  "RSS_FEEDS",
+  "RSS_INTERVAL_MIN",
+  "FALLBACK_THEMES",
+  "SCRIPT_PROVIDER",
+  "ANTHROPIC_MODEL",
+  "TTS_PROVIDER",
+  "OPENAI_API_KEY",
+  "OPENAI_TTS_MODEL",
+  "OPENAI_TTS_VOICE",
+  "OPENAI_TTS_INSTRUCTIONS",
+  "TTS_COMMAND",
+  "TTS_COMMAND_EXT",
 ] as const;
 
-/**
- * Read {@link Env} from `Deno.env` — the single point of `Deno.env` access.
- * Returns an empty record on non-Deno hosts (e.g. Cloudflare Workers).
- */
+export type Env = Partial<Record<(typeof ENV_KEYS)[number], string>>;
+
+const list = (value: string | undefined): string[] =>
+  (value ?? "").split(/[,\n]/).map((s) => s.trim()).filter(Boolean);
+
+const positive = (value: string | undefined, fallback: number): number => {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+};
+
+function oneOf<T extends string>(
+  value: string | undefined,
+  allowed: readonly T[],
+  fallback: T,
+): T {
+  if (!value) return fallback;
+  if ((allowed as readonly string[]).includes(value)) return value as T;
+  throw new Error(`Expected one of ${allowed.join(", ")}, got "${value}"`);
+}
+
+/** Derive the typed {@link Config} from a raw env record. */
+export function loadConfig(env: Env): Config {
+  return {
+    dataDir: env.DATA_DIR || "./data",
+    publicOrigin: (env.PUBLIC_ORIGIN ?? "").replace(/\/+$/, ""),
+    ingestToken: env.INGEST_TOKEN ?? "",
+    targetUnplayed: Math.floor(positive(env.TARGET_UNPLAYED, 3)),
+    episodeMinutes: positive(env.EPISODE_MINUTES, 5),
+    refillIntervalSec: positive(env.REFILL_INTERVAL_SEC, 300),
+    rssFeeds: list(env.RSS_FEEDS),
+    rssIntervalMin: positive(env.RSS_INTERVAL_MIN, 60),
+    fallbackThemes: list(env.FALLBACK_THEMES),
+    script: {
+      provider: oneOf(env.SCRIPT_PROVIDER, ["anthropic", "dummy"], "dummy"),
+      anthropicModel: env.ANTHROPIC_MODEL || "claude-opus-5-5",
+    },
+    tts: {
+      provider: oneOf(
+        env.TTS_PROVIDER,
+        ["openai", "command", "dummy"],
+        "dummy",
+      ),
+      openaiApiKey: env.OPENAI_API_KEY ?? "",
+      openaiModel: env.OPENAI_TTS_MODEL || "gpt-4o-mini-tts",
+      openaiVoice: env.OPENAI_TTS_VOICE || "alloy",
+      openaiInstructions: env.OPENAI_TTS_INSTRUCTIONS ||
+        "落ち着いたポッドキャストのパーソナリティとして、自然な日本語で話す。",
+      command: env.TTS_COMMAND ?? "",
+      commandExt: env.TTS_COMMAND_EXT || "mp3",
+    },
+  };
+}
+
+/** Read {@link Env} from `Deno.env` — the single point of `Deno.env` access. */
 export function denoEnv(): Env {
-  const deno = (globalThis as {
-    Deno?: { env: { get(key: string): string | undefined } };
-  }).Deno;
-  if (!deno) return {};
-  const env: Record<string, string> = {};
+  const env: Env = {};
   for (const key of ENV_KEYS) {
-    const value = deno.env.get(key);
+    const value = Deno.env.get(key);
     if (value !== undefined) env[key] = value;
   }
   return env;
 }
 
-/**
- * Read the raw host env: `Deno.env` on Deno, otherwise the Cloudflare Workers
- * `cloudflare:workers` `env` module. That module is imported dynamically so
- * Deno can catch the failure and fall through.
- */
-async function readEnv(): Promise<Env> {
-  if ((globalThis as { Deno?: unknown }).Deno) return denoEnv();
-  try {
-    const { env } = await import("cloudflare:workers");
-    return env as unknown as Env;
-  } catch {
-    return {};
-  }
-}
+const config: Config = loadConfig(denoEnv());
 
-// Resolve the config once, at module load, via top-level await. On Cloudflare
-// this reads string vars/secrets from the `cloudflare:workers` env at global
-// scope (allowed — it performs no binding I/O). This keeps getConfig() sync.
-const config: Config = loadConfig(await readEnv());
-
-/** The active {@link Config}, resolved from the host env at module load. */
+/** The process's {@link Config}, resolved from `Deno.env` at module load. */
 export function getConfig(): Config {
   return config;
 }
